@@ -36,6 +36,16 @@ from run_frontend_robustness import (
 
 
 SPLITS = ["train", "val", "test"]
+FINETUNE_ADAPTATION = {
+    "classifier_only": "classifier_only_linear_probe",
+    "fc1_only": "fc1_only_domain_adaptation",
+    "block6_fc1": "block6_fc1_domain_adaptation",
+}
+FINETUNE_PRETRAINING = {
+    "classifier_only": "AudioSet",
+    "fc1_only": "AudioSet+DeepShip",
+    "block6_fc1": "AudioSet+DeepShip",
+}
 
 
 class WaveformClipCacheDataset(Dataset):
@@ -97,7 +107,7 @@ def parse_args():
     parser.add_argument("--panns_ckpt", default=None)
     parser.add_argument("--panns_sample_rate", type=int, default=16000)
     parser.add_argument("--segment_length", type=float, default=3.0)
-    parser.add_argument("--finetune_mode", choices=["fc1_only", "block6_fc1"], default="fc1_only")
+    parser.add_argument("--finetune_mode", choices=["classifier_only", "fc1_only", "block6_fc1"], default="fc1_only")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--batch_size", type=int, default=16)
@@ -201,32 +211,52 @@ class PannsDeepShipClassifier(nn.Module):
 
 
 def configure_trainable(model: PannsDeepShipClassifier, finetune_mode: str):
+    if finetune_mode not in FINETUNE_ADAPTATION:
+        raise ValueError(f"Unsupported finetune_mode: {finetune_mode}")
+
     for param in model.panns_model.parameters():
         param.requires_grad = False
     for param in model.classifier.parameters():
         param.requires_grad = True
+
+    if finetune_mode == "classifier_only":
+        return
 
     if not hasattr(model.panns_model, "fc1"):
         raise AttributeError("Official Cnn14_16k model has no fc1 layer")
     for param in model.panns_model.fc1.parameters():
         param.requires_grad = True
 
-    if finetune_mode == "block6_fc1":
-        if not hasattr(model.panns_model, "conv_block6"):
-            raise AttributeError("Official Cnn14_16k model has no conv_block6 layer")
-        for param in model.panns_model.conv_block6.parameters():
-            param.requires_grad = True
+    if finetune_mode == "fc1_only":
+        return
+
+    if finetune_mode != "block6_fc1":
+        raise ValueError(f"Unsupported finetune_mode: {finetune_mode}")
+    if not hasattr(model.panns_model, "conv_block6"):
+        raise AttributeError("Official Cnn14_16k model has no conv_block6 layer")
+    for param in model.panns_model.conv_block6.parameters():
+        param.requires_grad = True
 
 
 def set_panns_training_mode(panns_model, classifier, finetune_mode):
+    if finetune_mode not in FINETUNE_ADAPTATION:
+        raise ValueError(f"Unsupported finetune_mode: {finetune_mode}")
+
     panns_model.eval()
     classifier.train()
+    if finetune_mode == "classifier_only":
+        return
     if finetune_mode == "fc1_only":
+        if not hasattr(panns_model, "fc1"):
+            raise AttributeError("Official Cnn14_16k model has no fc1 layer")
         panns_model.fc1.train()
-    elif finetune_mode == "block6_fc1":
-        if hasattr(panns_model, "conv_block6"):
-            panns_model.conv_block6.train()
-        panns_model.fc1.train()
+        return
+    if not hasattr(panns_model, "conv_block6"):
+        raise AttributeError("Official Cnn14_16k model has no conv_block6 layer")
+    if not hasattr(panns_model, "fc1"):
+        raise AttributeError("Official Cnn14_16k model has no fc1 layer")
+    panns_model.conv_block6.train()
+    panns_model.fc1.train()
 
 
 def early_conv_blocks_eval(panns_model):
@@ -245,17 +275,23 @@ def print_training_mode_status(model, finetune_mode, prefix="training mode"):
 
 
 def build_optimizer(model: PannsDeepShipClassifier, args):
+    if args.finetune_mode not in FINETUNE_ADAPTATION:
+        raise ValueError(f"Unsupported finetune_mode: {args.finetune_mode}")
+
     param_groups = []
     classifier_params = [p for p in model.classifier.parameters() if p.requires_grad]
     if classifier_params:
         param_groups.append({"params": classifier_params, "lr": args.lr_classifier, "name": "classifier"})
-    fc1_params = [p for p in model.panns_model.fc1.parameters() if p.requires_grad]
-    if fc1_params:
-        param_groups.append({"params": fc1_params, "lr": args.lr_fc1, "name": "fc1"})
+    if args.finetune_mode in ("fc1_only", "block6_fc1"):
+        fc1_params = [p for p in model.panns_model.fc1.parameters() if p.requires_grad]
+        if fc1_params:
+            param_groups.append({"params": fc1_params, "lr": args.lr_fc1, "name": "fc1"})
     if args.finetune_mode == "block6_fc1":
         block6_params = [p for p in model.panns_model.conv_block6.parameters() if p.requires_grad]
         if block6_params:
             param_groups.append({"params": block6_params, "lr": args.lr_backbone, "name": "conv_block6"})
+    if not param_groups:
+        raise ValueError("No trainable parameters were selected for the optimizer.")
     return torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
 
 
@@ -452,6 +488,8 @@ def main():
     )
     model = PannsDeepShipClassifier(wrapper.model, num_classes=num_classes).to(device)
     configure_trainable(model, args.finetune_mode)
+    adaptation = FINETUNE_ADAPTATION[args.finetune_mode]
+    pretraining = FINETUNE_PRETRAINING[args.finetune_mode]
 
     trainable_names = [name for name, param in model.named_parameters() if param.requires_grad]
     print(f"finetune_mode: {args.finetune_mode}", flush=True)
@@ -479,6 +517,9 @@ def main():
         "panns_ckpt": str(ckpt_path),
         "num_classes": num_classes,
         "class_names": class_names,
+        "finetune_mode": args.finetune_mode,
+        "adaptation": adaptation,
+        "pretraining": pretraining,
         "recording_overlap": recording_overlap,
         "smoke_max_clips_per_split": int(args.smoke_max_clips_per_split),
         "args": vars(args),
@@ -546,8 +587,9 @@ def main():
                 {
                     "frontend": "panns_cnn14_finetuned",
                     "base_frontend": "panns_cnn14",
-                    "pretraining": "AudioSet+DeepShip",
+                    "pretraining": pretraining,
                     "finetune_mode": args.finetune_mode,
+                    "adaptation": adaptation,
                     "model_state": model.panns_model.state_dict(),
                     "classifier_state": model.classifier.state_dict(),
                     "num_classes": num_classes,
@@ -607,6 +649,8 @@ def main():
         "best_val_recording_macro_f1": best_val_recording_macro_f1,
         "best_val_clip_macro_f1": best_val_clip_macro_f1,
         "finetune_mode": args.finetune_mode,
+        "adaptation": adaptation,
+        "pretraining": pretraining,
         "smoke_max_clips_per_split": int(args.smoke_max_clips_per_split),
     }
     write_json(output_dir / "metrics.json", metrics)

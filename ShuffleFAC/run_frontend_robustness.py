@@ -32,9 +32,14 @@ from model.shuffleFAC import shuffleFAC
 
 
 FRONTENDS = ["shufflefac", "resnet18", "mobilenet_v2", "panns_cnn14"]
-HEADS = ["mean", "attention", "sn_decoupled", "bigru", "mil_linear_softmax"]
+HEADS = ["mean", "attention", "sn_decoupled", "sn_expd_warmup5", "bigru", "mil_linear_softmax"]
 SPLITS = ["train", "val", "test"]
 TORCHVISION_TRAINED_FRONTENDS = {"resnet18", "mobilenet_v2"}
+EXP_D_EDGE_MODE = "threshold_similarity"
+EXP_D_SIM_THRESHOLD = 0.8
+EXP_D_SIGNAL_TOP_K = 4
+EXP_D_TOPK_WARMUP_EPOCHS = 5
+EMBEDDING_CACHE_SCHEMA = "recording_all_clip_embeddings_v2"
 
 
 class TeeStream:
@@ -771,14 +776,17 @@ def frontend_cache_key(
     ckpt_path: Optional[str],
     embed_dim: int,
     checkpoint: Optional[dict] = None,
+    smoke_max_recordings_per_split: int = 0,
 ):
     payload = {
+        "cache_schema": EMBEDDING_CACHE_SCHEMA,
         "frontend": frontend,
         "source_cache": str(source_cache.resolve()),
         "clips_per_recording": int(clips_per_recording),
         "frontend_ckpt": str(ckpt_path) if ckpt_path else None,
         "frontend_ckpt_metadata": checkpoint_cache_metadata(ckpt_path, checkpoint),
         "embed_dim": int(embed_dim),
+        "smoke_max_recordings_per_split": int(smoke_max_recordings_per_split),
     }
     return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -794,6 +802,7 @@ def panns_frontend_cache_key(
     resolved_ckpt = Path(ckpt_path).expanduser().resolve()
     stat = resolved_ckpt.stat()
     payload = {
+        "cache_schema": EMBEDDING_CACHE_SCHEMA,
         "frontend": "panns_cnn14",
         "source_cache": str(source_cache.resolve()),
         "clips_per_recording": int(clips_per_recording),
@@ -808,6 +817,7 @@ def panns_frontend_cache_key(
         "input_type": "waveform",
         "embed_dim": int(embed_dim),
         "weights": "Cnn14_16k_mAP=0.438",
+        "smoke_max_recordings_per_split": int(args.smoke_max_recordings_per_split),
     }
     return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -823,6 +833,7 @@ def encode_recording_cache(split_name: str, source_cache_path: Path, frontend, f
         frontend_ckpt,
         embed_dim,
         getattr(frontend, "checkpoint", None),
+        smoke_max_recordings_per_split=args.smoke_max_recordings_per_split,
     )
     out_path = out_dir / f"{frontend_name}_{split_name}_S{args.clips_per_recording}_{key[:12]}.pt"
     if out_path.exists() and not args.rebuild_embedding_cache:
@@ -832,6 +843,8 @@ def encode_recording_cache(split_name: str, source_cache_path: Path, frontend, f
 
     source = validate_source_cache(source_cache_path, split_name)
     clip_features, source_entries, recordings = group_recordings(source)
+    if int(args.smoke_max_recordings_per_split) > 0:
+        recordings = recordings[: int(args.smoke_max_recordings_per_split)]
     expected_input_shape = getattr(frontend, "input_shape", None)
     if expected_input_shape is not None:
         expected_input_shape = [int(v) for v in expected_input_shape]
@@ -841,10 +854,12 @@ def encode_recording_cache(split_name: str, source_cache_path: Path, frontend, f
                 f"Front-end checkpoint input_shape mismatch for {split_name}: "
                 f"checkpoint={expected_input_shape}, source_cache={actual_input_shape}"
             )
-    bags = []
+
     labels = []
     recording_ids = []
     selected_indices_all = []
+    recording_source_indices = []
+    all_embeddings = []
     batch_clips = []
     batch_meta = []
     frontend.eval()
@@ -855,39 +870,72 @@ def encode_recording_cache(split_name: str, source_cache_path: Path, frontend, f
         clips = torch.stack(batch_clips, dim=0).float().to(device, non_blocking=True)
         emb = frontend(clips).detach().cpu().float()
         for row, (rec_idx, clip_pos) in enumerate(batch_meta):
-            bags[rec_idx][clip_pos] = emb[row]
+            all_embeddings[rec_idx][clip_pos] = emb[row]
         batch_clips.clear()
         batch_meta.clear()
 
     for rec_idx, (rid, indices, label) in enumerate(recordings):
         picked = fixed_bag_indices(indices, args.clips_per_recording)
-        bags.append([None] * int(args.clips_per_recording))
         labels.append(int(label))
         recording_ids.append(str(rid))
         selected_indices_all.append([int(i) for i in picked])
-        for clip_pos, clip_index in enumerate(picked):
+        recording_source_indices.append([int(i) for i in indices])
+        all_embeddings.append([None] * len(indices))
+        for clip_pos, clip_index in enumerate(indices):
             batch_clips.append(clip_features[clip_index].float())
             batch_meta.append((rec_idx, clip_pos))
             if len(batch_clips) >= args.frontend_batch_size:
                 flush_batch()
     flush_batch()
 
-    feature_tensor = torch.stack([torch.stack(items, dim=0) for items in bags], dim=0).float()
+    flat_embeddings = []
+    recording_embedding_indices = []
+    fixed_bags = []
+    cursor = 0
+    for rec_idx, (_rid, indices, _label) in enumerate(recordings):
+        rec_embs = all_embeddings[rec_idx]
+        if any(item is None for item in rec_embs):
+            raise RuntimeError(f"Missing encoded clip embeddings for recording index {rec_idx}")
+        rec_indices = list(range(cursor, cursor + len(rec_embs)))
+        recording_embedding_indices.append(rec_indices)
+        flat_embeddings.extend(rec_embs)
+        cursor += len(rec_embs)
+
+        source_index_to_pos = {int(source_index): pos for pos, source_index in enumerate(indices)}
+        fixed_bags.append(
+            torch.stack([rec_embs[source_index_to_pos[int(source_index)]] for source_index in selected_indices_all[rec_idx]], dim=0)
+        )
+
+    if fixed_bags:
+        feature_tensor = torch.stack(fixed_bags, dim=0).float()
+        clip_embedding_tensor = torch.stack(flat_embeddings, dim=0).float()
+    else:
+        feature_tensor = torch.empty((0, int(args.clips_per_recording), int(embed_dim)), dtype=torch.float32)
+        clip_embedding_tensor = torch.empty((0, int(embed_dim)), dtype=torch.float32)
     label_tensor = torch.tensor(labels, dtype=torch.long)
     payload = {
+        "cache_schema": EMBEDDING_CACHE_SCHEMA,
         "cache_key": key,
         "frontend": frontend_name,
         "frontend_ckpt": frontend_ckpt,
         "source_cache": str(source_cache_path),
         "split_name": split_name,
         "features": feature_tensor,
+        "clip_embeddings": clip_embedding_tensor,
         "labels": label_tensor,
         "recording_ids": recording_ids,
+        "recording_embedding_indices": recording_embedding_indices,
+        "recording_source_indices": recording_source_indices,
         "selected_source_indices": selected_indices_all,
         "clips_per_recording": int(args.clips_per_recording),
-        "embed_dim": int(feature_tensor.size(-1)),
+        "embed_dim": int(feature_tensor.size(-1)) if feature_tensor.ndim == 3 else int(embed_dim),
         "metadata": source.get("metadata", {}),
         "source_split_name": source.get("split_name"),
+        "sampling_protocol": {
+            "train": "random_recording_clip_bag_from_all_embeddings",
+            "eval": "deterministic_multisample_recording_clip_bag_from_all_embeddings",
+        },
+        "smoke_max_recordings_per_split": int(args.smoke_max_recordings_per_split),
     }
     torch.save(payload, out_path)
     return payload, out_path, False
@@ -927,10 +975,11 @@ def encode_recording_cache_panns(
     if int(args.smoke_max_recordings_per_split) > 0:
         recordings = recordings[: int(args.smoke_max_recordings_per_split)]
 
-    bags = []
     labels = []
     recording_ids = []
     selected_indices_all = []
+    recording_source_indices = []
+    all_embeddings = []
     batch_waveforms = []
     batch_meta = []
     frontend.eval()
@@ -943,17 +992,18 @@ def encode_recording_cache_panns(
         if emb.ndim != 2 or int(emb.size(-1)) != int(embed_dim):
             raise ValueError(f"Expected PANNs embedding [B, {embed_dim}], got {tuple(emb.shape)}")
         for row, (rec_idx, clip_pos) in enumerate(batch_meta):
-            bags[rec_idx][clip_pos] = emb[row]
+            all_embeddings[rec_idx][clip_pos] = emb[row]
         batch_waveforms.clear()
         batch_meta.clear()
 
     for rec_idx, (rid, indices, label) in enumerate(recordings):
         picked = fixed_bag_indices(indices, args.clips_per_recording)
-        bags.append([None] * int(args.clips_per_recording))
         labels.append(int(label))
         recording_ids.append(str(rid))
         selected_indices_all.append([int(i) for i in picked])
-        for clip_pos, clip_index in enumerate(picked):
+        recording_source_indices.append([int(i) for i in indices])
+        all_embeddings.append([None] * len(indices))
+        for clip_pos, clip_index in enumerate(indices):
             waveform = load_waveform_segment_from_entry(
                 entries[clip_index],
                 source_cache_path=source_cache_path,
@@ -967,12 +1017,33 @@ def encode_recording_cache_panns(
                 flush_batch()
     flush_batch()
 
-    if bags:
-        feature_tensor = torch.stack([torch.stack(items, dim=0) for items in bags], dim=0).float()
+    flat_embeddings = []
+    recording_embedding_indices = []
+    fixed_bags = []
+    cursor = 0
+    for rec_idx, (_rid, indices, _label) in enumerate(recordings):
+        rec_embs = all_embeddings[rec_idx]
+        if any(item is None for item in rec_embs):
+            raise RuntimeError(f"Missing encoded PANNs clip embeddings for recording index {rec_idx}")
+        rec_indices = list(range(cursor, cursor + len(rec_embs)))
+        recording_embedding_indices.append(rec_indices)
+        flat_embeddings.extend(rec_embs)
+        cursor += len(rec_embs)
+
+        source_index_to_pos = {int(source_index): pos for pos, source_index in enumerate(indices)}
+        fixed_bags.append(
+            torch.stack([rec_embs[source_index_to_pos[int(source_index)]] for source_index in selected_indices_all[rec_idx]], dim=0)
+        )
+
+    if fixed_bags:
+        feature_tensor = torch.stack(fixed_bags, dim=0).float()
+        clip_embedding_tensor = torch.stack(flat_embeddings, dim=0).float()
     else:
         feature_tensor = torch.empty((0, int(args.clips_per_recording), int(embed_dim)), dtype=torch.float32)
+        clip_embedding_tensor = torch.empty((0, int(embed_dim)), dtype=torch.float32)
     label_tensor = torch.tensor(labels, dtype=torch.long)
     payload = {
+        "cache_schema": EMBEDDING_CACHE_SCHEMA,
         "cache_key": key,
         "frontend": "panns_cnn14",
         "frontend_source": "official_audioset_tagging_cnn",
@@ -980,8 +1051,11 @@ def encode_recording_cache_panns(
         "source_cache": str(source_cache_path),
         "split_name": split_name,
         "features": feature_tensor,
+        "clip_embeddings": clip_embedding_tensor,
         "labels": label_tensor,
         "recording_ids": recording_ids,
+        "recording_embedding_indices": recording_embedding_indices,
+        "recording_source_indices": recording_source_indices,
         "selected_source_indices": selected_indices_all,
         "clips_per_recording": int(args.clips_per_recording),
         "embed_dim": 2048,
@@ -993,6 +1067,10 @@ def encode_recording_cache_panns(
         "pretraining": "AudioSet",
         "metadata": source.get("metadata", {}),
         "source_split_name": source.get("split_name"),
+        "sampling_protocol": {
+            "train": "random_recording_clip_bag_from_all_embeddings",
+            "eval": "deterministic_multisample_recording_clip_bag_from_all_embeddings",
+        },
         "smoke_max_recordings_per_split": int(args.smoke_max_recordings_per_split),
     }
     torch.save(payload, out_path)
@@ -1026,6 +1104,62 @@ class EmbeddingBagDataset(Dataset):
     def __getitem__(self, index):
         rid = self.recording_ids[index] if index < len(self.recording_ids) else str(index)
         return self.features[index], self.labels[index], rid
+
+
+class DynamicEmbeddingBagDataset(Dataset):
+    """Samples recording bags from all cached per-clip embeddings."""
+
+    def __init__(self, cache_payload: dict, clips_per_recording: int, train: bool = False, seed: int = 42):
+        clip_embeddings = cache_payload.get("clip_embeddings")
+        rec_indices = cache_payload.get("recording_embedding_indices")
+        if clip_embeddings is None or rec_indices is None:
+            raise ValueError("sn_expd_warmup5 requires clip_embeddings and recording_embedding_indices in the cache")
+        self.features = clip_embeddings.float()
+        self.labels = cache_payload["labels"].long()
+        self.recording_ids = [str(x) for x in cache_payload.get("recording_ids", [])]
+        self.recording_embedding_indices = [[int(i) for i in indices] for indices in rec_indices]
+        self.clips_per_recording = int(clips_per_recording)
+        self.train = bool(train)
+        self.rng = random.Random(int(seed))
+        if len(self.recording_embedding_indices) != int(self.labels.numel()):
+            raise ValueError("recording_embedding_indices/labels length mismatch")
+
+    def __len__(self):
+        return int(self.labels.numel())
+
+    def _sample_indices(self, indices, eval_sample_id: int = 0, eval_samples: int = 1):
+        s = self.clips_per_recording
+        n = len(indices)
+        if n <= 0:
+            raise ValueError("Empty recording bag")
+        if self.train:
+            if n >= s:
+                return sorted(self.rng.sample(indices, s))
+            return [self.rng.choice(indices) for _ in range(s)]
+
+        eval_samples = max(int(eval_samples), 1)
+        eval_sample_id = int(eval_sample_id) % eval_samples
+        if n >= s:
+            if eval_samples > 1:
+                phase = (eval_sample_id + 0.5) / eval_samples
+                positions = (np.arange(s, dtype=np.float64) + phase) * n / s - 0.5
+                positions = np.clip(np.rint(positions), 0, n - 1).astype(int)
+            else:
+                positions = np.rint(np.linspace(0, n - 1, num=s)).astype(int)
+            return [indices[int(pos)] for pos in positions]
+        return [indices[(i + eval_sample_id) % n] for i in range(s)]
+
+    def get_eval_item(self, index, eval_sample_id: int = 0, eval_samples: int = 1):
+        picked = self._sample_indices(self.recording_embedding_indices[index], eval_sample_id, eval_samples)
+        rid = self.recording_ids[index] if index < len(self.recording_ids) else str(index)
+        return self.features[picked].float(), self.labels[index], rid
+
+    def __getitem__(self, index):
+        if not self.train:
+            return self.get_eval_item(index)
+        picked = self._sample_indices(self.recording_embedding_indices[index])
+        rid = self.recording_ids[index] if index < len(self.recording_ids) else str(index)
+        return self.features[picked].float(), self.labels[index], rid
 
 
 class EmbeddingAdapter(nn.Module):
@@ -1275,6 +1409,145 @@ class SignalNoiseHead(nn.Module):
         return (logits, parts) if return_parts else logits
 
 
+class SignalNoiseExpDWarmup5Head(nn.Module):
+    """ExpD Warmup5 SN head over cached embeddings, without the robustness adapter."""
+
+    def __init__(self, in_dim, num_classes, sig_dim=32, noise_dim=32, graph_k=2, dropout=0.1):
+        super().__init__()
+        self.input_norm = nn.LayerNorm(in_dim)
+        self.signal_proj = nn.Sequential(
+            nn.Linear(in_dim, sig_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(sig_dim, sig_dim),
+            nn.LayerNorm(sig_dim),
+        )
+        self.noise_proj = nn.Sequential(
+            nn.Linear(in_dim, noise_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(noise_dim, noise_dim),
+            nn.LayerNorm(noise_dim),
+        )
+        self.graph_k = int(graph_k)
+        self.edge_mode = EXP_D_EDGE_MODE
+        self.sim_threshold = float(EXP_D_SIM_THRESHOLD)
+        self.signal_top_k = int(EXP_D_SIGNAL_TOP_K)
+        self.topk_warmup_epochs = int(EXP_D_TOPK_WARMUP_EPOCHS)
+        self.current_epoch = 0
+        self.noise_graph = NoiseGraphConv(noise_dim, dropout=dropout)
+        self.graph_res_scale = nn.Parameter(torch.tensor(0.1))
+        self.noise_attn = nn.Sequential(
+            nn.Linear(noise_dim, max(noise_dim // 2, 1)),
+            nn.Tanh(),
+            nn.Dropout(dropout),
+            nn.Linear(max(noise_dim // 2, 1), 1),
+        )
+        self.noise_to_suppression = nn.Sequential(nn.LayerNorm(noise_dim), nn.Linear(noise_dim, sig_dim), nn.Sigmoid())
+        self.signal_attn = nn.Sequential(
+            nn.Linear(sig_dim, max(sig_dim // 2, 1)),
+            nn.Tanh(),
+            nn.Dropout(dropout),
+            nn.Linear(max(sig_dim // 2, 1), 1),
+        )
+        self.classifier = nn.Sequential(nn.Dropout(dropout), nn.Linear(sig_dim, num_classes))
+        self.last_attn_entropy = torch.tensor(0.0)
+        self.last_graph_delta_norm = torch.tensor(0.0)
+        self.last_avg_graph_degree = torch.tensor(0.0)
+        self.last_signal_topk_count = torch.tensor(0.0)
+
+    def _build_graph(self, z):
+        b, s, _ = z.shape
+        if s <= 1:
+            self.last_avg_graph_degree = z.new_tensor(0.0).detach()
+            return torch.zeros((b, s, 1), dtype=torch.long, device=z.device)
+
+        adj = torch.zeros((b, s, s), dtype=torch.bool, device=z.device)
+        for i in range(s):
+            if i > 0:
+                adj[:, i, i - 1] = True
+            if i + 1 < s:
+                adj[:, i, i + 1] = True
+
+        normed = F.normalize(z, p=2, dim=-1)
+        sim = torch.bmm(normed, normed.transpose(1, 2))
+        eye = torch.eye(s, dtype=torch.bool, device=z.device).unsqueeze(0)
+        sim = sim.masked_fill(eye, -float("inf"))
+        adj = adj | (sim > self.sim_threshold)
+
+        self.last_avg_graph_degree = adj.sum(dim=-1).float().mean().detach()
+        max_degree = max(int(adj.sum(dim=-1).max().item()), 1)
+        out = torch.zeros((b, s, max_degree), dtype=torch.long, device=z.device)
+        for bi in range(b):
+            for i in range(s):
+                idx = torch.nonzero(adj[bi, i], as_tuple=False).flatten()
+                if idx.numel() == 0:
+                    idx = torch.tensor([i], dtype=torch.long, device=z.device)
+                if idx.numel() < max_degree:
+                    idx = torch.cat([idx, idx[:1].expand(max_degree - idx.numel())], dim=0)
+                out[bi, i] = idx[:max_degree]
+        return out
+
+    def topk_masked_softmax(self, signal_scores):
+        s = signal_scores.size(1)
+        apply_topk = self.signal_top_k > 0 and s > 1
+        if apply_topk and self.training and getattr(self, "current_epoch", 1) <= self.topk_warmup_epochs:
+            apply_topk = False
+
+        if apply_topk:
+            k = min(self.signal_top_k, s)
+            scores_2d = signal_scores.squeeze(-1)
+            topk_idx = scores_2d.topk(k=k, dim=1).indices
+            mask_2d = torch.zeros_like(scores_2d, dtype=torch.bool)
+            mask_2d.scatter_(1, topk_idx, True)
+            min_val = torch.finfo(signal_scores.dtype).min
+            masked_scores = signal_scores.masked_fill(~mask_2d.unsqueeze(-1), min_val)
+            signal_topk_mask = mask_2d
+        else:
+            masked_scores = signal_scores
+            signal_topk_mask = torch.ones_like(signal_scores.squeeze(-1), dtype=torch.bool)
+
+        return torch.softmax(masked_scores, dim=1), signal_topk_mask
+
+    def forward(self, x, return_parts=False):
+        z = self.input_norm(x)
+        z_sig = self.signal_proj(z)
+        z_noise = self.noise_proj(z)
+        if z_noise.size(1) > 1:
+            update = self.noise_graph(z_noise, self._build_graph(z_noise))
+            z_noise_smooth = z_noise + self.graph_res_scale * update
+        else:
+            z_noise_smooth = z_noise
+            self.last_avg_graph_degree = z_noise.new_tensor(0.0).detach()
+        self.last_graph_delta_norm = (z_noise_smooth - z_noise).norm(dim=-1).mean().detach()
+
+        noise_scores = self.noise_attn(z_noise_smooth)
+        noise_weights = torch.softmax(noise_scores, dim=1)
+        global_noise = (noise_weights * z_noise_smooth).sum(dim=1)
+        suppression = self.noise_to_suppression(global_noise).unsqueeze(1)
+        z_sig_filtered = z_sig * (1.0 - suppression)
+
+        signal_scores = self.signal_attn(z_sig_filtered)
+        signal_weights, signal_topk_mask = self.topk_masked_softmax(signal_scores)
+        entropy = -(signal_weights * (signal_weights + 1e-8).log()).sum(dim=1).mean()
+        self.last_attn_entropy = entropy.detach()
+        self.last_signal_topk_count = signal_topk_mask.float().sum(dim=1).mean().detach()
+
+        pooled = (signal_weights * z_sig_filtered).sum(dim=1)
+        logits = self.classifier(pooled)
+        parts = {
+            "z_sig": z_sig,
+            "z_noise": z_noise,
+            "z_noise_smooth": z_noise_smooth,
+            "global_noise": global_noise,
+            "suppression": suppression.squeeze(1),
+            "signal_weights": signal_weights,
+            "signal_topk_mask": signal_topk_mask,
+            "noise_weights": noise_weights,
+        }
+        return (logits, parts) if return_parts else logits
+
+
 class BiGRUHead(nn.Module):
     def __init__(self, in_dim, num_classes, hidden_dim=64, adapter_dim=256, dropout=0.1):
         super().__init__()
@@ -1327,6 +1600,15 @@ def build_head(name: str, in_dim: int, num_classes: int, args):
             signal_top_k=args.signal_top_k,
             topk_warmup_epochs=args.topk_warmup_epochs,
             adapter_dim=args.adapter_dim,
+            dropout=args.dropout,
+        )
+    if name == "sn_expd_warmup5":
+        return SignalNoiseExpDWarmup5Head(
+            in_dim,
+            num_classes,
+            sig_dim=args.sig_dim,
+            noise_dim=args.noise_dim,
+            graph_k=args.graph_k,
             dropout=args.dropout,
         )
     if name == "bigru":
@@ -1435,6 +1717,87 @@ def run_epoch(model, loader, criterion, device, args, optimizer=None, epoch=None
     return metrics
 
 
+@torch.no_grad()
+def collect_multisample_embedding_predictions(model, dataset, criterion, device, args):
+    model.eval()
+    if hasattr(model, "current_epoch"):
+        model.current_epoch = 99999
+    eval_samples = max(int(args.eval_samples), 1)
+    batch_size = max(int(args.batch_size), 1)
+    y_true = []
+    recording_ids = []
+    logits_all = []
+    totals = {"total": 0.0, "task": 0.0, "orth": 0.0, "noise_consistency": 0.0}
+    entropy_vals = []
+    delta_vals = []
+    degree_vals = []
+    topk_count_vals = []
+
+    for start in range(0, len(dataset), batch_size):
+        batch_indices = list(range(start, min(start + batch_size, len(dataset))))
+        labels = torch.stack([dataset.labels[i] for i in batch_indices]).to(device, non_blocking=True)
+        sample_logits = []
+        sample_losses = []
+        for sample_id in range(eval_samples):
+            xs = []
+            for i in batch_indices:
+                x, _label, _rid = dataset.get_eval_item(i, sample_id, eval_samples)
+                xs.append(x)
+            x_batch = torch.stack(xs, dim=0).to(device, non_blocking=True)
+            logits, losses = compute_loss(model, x_batch, labels, criterion, args)
+            sample_logits.append(logits.detach())
+            sample_losses.append({key: value.detach() for key, value in losses.items()})
+            if hasattr(model, "last_attn_entropy"):
+                entropy_vals.append(float(model.last_attn_entropy.detach().cpu()))
+            if hasattr(model, "last_graph_delta_norm"):
+                delta_vals.append(float(model.last_graph_delta_norm.detach().cpu()))
+            if hasattr(model, "last_avg_graph_degree"):
+                degree_vals.append(float(model.last_avg_graph_degree.detach().cpu()))
+            if hasattr(model, "last_signal_topk_count"):
+                topk_count_vals.append(float(model.last_signal_topk_count.detach().cpu()))
+
+        mean_logits = torch.stack(sample_logits, dim=0).mean(dim=0)
+        task_on_mean = criterion(mean_logits, labels).detach()
+        batch = int(labels.size(0))
+        mean_losses = {key: torch.stack([losses[key] for losses in sample_losses]).mean() for key in totals}
+        mean_losses["task"] = task_on_mean
+        mean_losses["total"] = (
+            task_on_mean
+            + float(args.lambda_orth) * mean_losses["orth"]
+            + float(args.lambda_noise_consistency) * mean_losses["noise_consistency"]
+        )
+        for key, value in mean_losses.items():
+            totals[key] += float(value.detach().cpu()) * batch
+        y_true.extend(labels.detach().cpu().numpy().tolist())
+        recording_ids.extend([dataset.recording_ids[i] if i < len(dataset.recording_ids) else str(i) for i in batch_indices])
+        logits_all.append(mean_logits.detach().cpu())
+
+    logits_np = torch.cat(logits_all, dim=0).numpy() if logits_all else np.zeros((0, 1), dtype=np.float32)
+    pred_np = logits_np.argmax(axis=1) if logits_np.size else np.asarray([], dtype=np.int64)
+    metrics = metrics_from_arrays(np.asarray(y_true), pred_np) if y_true else {
+        "ACC": math.nan,
+        "Macro-F1": math.nan,
+        "Macro-Precision": math.nan,
+        "Macro-Recall": math.nan,
+        "Weighted-F1": math.nan,
+    }
+    n = len(y_true)
+    for key, value in totals.items():
+        metrics[f"{key}_loss"] = value / max(n, 1)
+    if entropy_vals:
+        metrics["attn_entropy"] = float(np.mean(entropy_vals))
+    if delta_vals:
+        metrics["graph_delta_norm"] = float(np.mean(delta_vals))
+    if degree_vals:
+        metrics["avg_graph_degree"] = float(np.mean(degree_vals))
+    if topk_count_vals:
+        metrics["avg_signal_topk_count"] = float(np.mean(topk_count_vals))
+    if hasattr(model, "graph_res_scale"):
+        metrics["graph_res_scale"] = float(model.graph_res_scale.detach().cpu())
+    metrics["recording_ids"] = recording_ids
+    return metrics
+
+
 def save_epoch_csv(path: Path, rows: list):
     if not rows:
         return
@@ -1445,7 +1808,136 @@ def save_epoch_csv(path: Path, rows: list):
         writer.writerows(rows)
 
 
+def train_sn_expd_warmup5_head(head_name: str, frontend_name: str, cache_payloads: dict, cache_paths: dict, args, output_dir: Path, device: torch.device):
+    train_set = DynamicEmbeddingBagDataset(cache_payloads["train"], args.clips_per_recording, train=True, seed=args.seed)
+    val_set = DynamicEmbeddingBagDataset(cache_payloads["val"], args.clips_per_recording, train=False, seed=args.seed)
+    test_set = DynamicEmbeddingBagDataset(cache_payloads["test"], args.clips_per_recording, train=False, seed=args.seed)
+    pin_memory = device.type == "cuda"
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=pin_memory)
+    in_dim = int(train_set.features.size(-1))
+    num_classes = int(torch.cat([train_set.labels, val_set.labels, test_set.labels]).max().item()) + 1
+    model = build_head(head_name, in_dim, num_classes, args).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr, weight_decay=args.weight_decay)
+
+    head_dir = output_dir / head_name
+    head_dir.mkdir(parents=True, exist_ok=True)
+    best_path = head_dir / "best_head.pt"
+    best_val = -1.0
+    best_epoch = -1
+    stale = 0
+    rows = []
+    for epoch in range(1, args.epochs + 1):
+        train_metrics = run_epoch(model, train_loader, criterion, device, args, optimizer=optimizer, epoch=epoch)
+        val_metrics = collect_multisample_embedding_predictions(model, val_set, criterion, device, args)
+        row = {
+            "epoch": epoch,
+            "train_loss": train_metrics["total_loss"],
+            "train_task_loss": train_metrics["task_loss"],
+            "train_orth_loss": train_metrics["orth_loss"],
+            "train_noise_consistency_loss": train_metrics["noise_consistency_loss"],
+            "train_acc": train_metrics["ACC"],
+            "train_macro_f1": train_metrics["Macro-F1"],
+            "val_loss": val_metrics["total_loss"],
+            "val_task_loss": val_metrics["task_loss"],
+            "val_orth_loss": val_metrics["orth_loss"],
+            "val_noise_consistency_loss": val_metrics["noise_consistency_loss"],
+            "val_acc": val_metrics["ACC"],
+            "val_macro_f1": val_metrics["Macro-F1"],
+            "val_macro_precision": val_metrics["Macro-Precision"],
+            "val_macro_recall": val_metrics["Macro-Recall"],
+        }
+        for metric_key in ["attn_entropy", "graph_delta_norm", "avg_graph_degree", "avg_signal_topk_count", "graph_res_scale"]:
+            if metric_key in train_metrics:
+                row[f"train_{metric_key}"] = train_metrics[metric_key]
+            if metric_key in val_metrics:
+                row[f"val_{metric_key}"] = val_metrics[metric_key]
+        rows.append(row)
+        print(
+            f"{head_name} epoch={epoch} train_loss={row['train_loss']:.6f} "
+            f"val_acc={row['val_acc']:.6f} val_macro_f1={row['val_macro_f1']:.6f} "
+            f"val_avg_degree={row.get('val_avg_graph_degree', float('nan')):.3f} "
+            f"val_topk={row.get('val_avg_signal_topk_count', float('nan')):.3f}",
+            flush=True,
+        )
+        if math.isfinite(val_metrics["Macro-F1"]) and val_metrics["Macro-F1"] > best_val:
+            best_val = val_metrics["Macro-F1"]
+            best_epoch = epoch
+            stale = 0
+            torch.save({"epoch": epoch, "model_state": model.state_dict(), "best_val_macro_f1": best_val, "args": vars(args)}, best_path)
+        else:
+            stale += 1
+            if args.patience > 0 and stale >= args.patience:
+                print(f"{head_name} early stopping at epoch {epoch}", flush=True)
+                break
+
+    save_epoch_csv(head_dir / "epoch_metrics.csv", rows)
+    if best_path.exists():
+        state = torch_load(best_path, map_location=device)
+        model.load_state_dict(state["model_state"])
+    test_metrics = collect_multisample_embedding_predictions(model, test_set, criterion, device, args)
+    param_summary = {
+        "total_params": int(sum(p.numel() for p in model.parameters())),
+        "trainable_params": int(sum(p.numel() for p in model.parameters() if p.requires_grad)),
+    }
+    payload = {
+        "frontend": frontend_name,
+        "head": head_name,
+        "head_type": "signal_noise_expd_warmup5",
+        "dataset": args.dataset,
+        "seed": args.seed,
+        "best_epoch": best_epoch,
+        "best_val_macro_f1": best_val,
+        "best_checkpoint_selection": "validation_recording_macro_f1",
+        "clips_per_recording": int(args.clips_per_recording),
+        "eval_samples": int(args.eval_samples),
+        "embed_dim": in_dim,
+        "embed_dim_raw": in_dim,
+        "adapter_dim": None,
+        "edge_mode": EXP_D_EDGE_MODE,
+        "graph_k": int(args.graph_k),
+        "sim_threshold": float(EXP_D_SIM_THRESHOLD),
+        "signal_top_k": int(EXP_D_SIGNAL_TOP_K),
+        "topk_warmup_epochs": int(EXP_D_TOPK_WARMUP_EPOCHS),
+        "use_temperature": False,
+        "lambda_orth": float(args.lambda_orth),
+        "lambda_noise_consistency": float(args.lambda_noise_consistency),
+        "optimizer": "Adam",
+        "lr": float(args.lr),
+        "weight_decay": float(args.weight_decay),
+        "grad_clip": float(args.grad_clip),
+        "sampling_protocol": "train_random_eval_deterministic_multisample_mean_logits",
+        "num_classes": num_classes,
+        "train_recordings": len(train_set),
+        "val_recordings": len(val_set),
+        "test_recordings": len(test_set),
+        "cache_paths": {k: str(v) for k, v in cache_paths.items()},
+        "test_acc": test_metrics["ACC"],
+        "test_macro_f1": test_metrics["Macro-F1"],
+        "test_macro_precision": test_metrics["Macro-Precision"],
+        "test_macro_recall": test_metrics["Macro-Recall"],
+        "test_weighted_f1": test_metrics["Weighted-F1"],
+        "test_loss": test_metrics["total_loss"],
+        "test_task_loss": test_metrics["task_loss"],
+        "test_orth_loss": test_metrics["orth_loss"],
+        "test_noise_consistency_loss": test_metrics["noise_consistency_loss"],
+        **param_summary,
+    }
+    for metric_key in ["attn_entropy", "graph_delta_norm", "avg_graph_degree", "avg_signal_topk_count", "graph_res_scale"]:
+        if metric_key in test_metrics:
+            payload[metric_key] = test_metrics[metric_key]
+    write_json(head_dir / "metrics.json", payload)
+    with (head_dir / "metrics.csv").open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(payload.keys()))
+        writer.writeheader()
+        writer.writerow(payload)
+    return payload
+
+
 def train_one_head(head_name: str, frontend_name: str, cache_payloads: dict, cache_paths: dict, args, output_dir: Path, device: torch.device):
+    if head_name == "sn_expd_warmup5":
+        return train_sn_expd_warmup5_head(head_name, frontend_name, cache_payloads, cache_paths, args, output_dir, device)
+
     train_set = EmbeddingBagDataset(cache_payloads["train"])
     val_set = EmbeddingBagDataset(cache_payloads["val"])
     test_set = EmbeddingBagDataset(cache_payloads["test"])
@@ -1579,7 +2071,7 @@ def parse_args():
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--dataset", default="auto")
     parser.add_argument("--frontend", default="shufflefac", help="One of shufflefac/resnet18/mobilenet_v2/panns_cnn14, all, or a comma list.")
-    parser.add_argument("--head", default="attention", help="One of mean/attention/sn_decoupled/bigru/mil_linear_softmax, all, or a comma list.")
+    parser.add_argument("--head", default="attention", help="One of mean/attention/sn_decoupled/sn_expd_warmup5/bigru/mil_linear_softmax, all, or a comma list.")
     parser.add_argument("--frontend_ckpt", default=None, help="Optional front-end checkpoint. Required for resnet18/mobilenet_v2 paper experiments.")
     parser.add_argument("--allow_random_frontend_for_smoke_test", action="store_true", help="Allow random frozen resnet18/mobilenet_v2 only for explicit smoke tests.")
     parser.add_argument("--debug_waveform_entry", action="store_true")
@@ -1598,6 +2090,7 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--eval_samples", type=int, default=5, help="Deterministic multi-sample passes for sn_expd_warmup5 validation/test.")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -1685,6 +2178,8 @@ def run_frontend(frontend_name: str, head_names: list, args, root: Path, model_c
         "embedding_cache_paths": {k: str(v) for k, v in embedding_cache_paths.items()},
         "recordings": {k: int(cache_payloads[k]["labels"].numel()) for k in SPLITS},
         "recording_overlap": overlaps,
+        "cache_schema": EMBEDDING_CACHE_SCHEMA,
+        "smoke_max_recordings_per_split": int(args.smoke_max_recordings_per_split),
     }
     write_json(frontend_dir / "frontend_cache_summary.json", frontend_summary)
     rows = []

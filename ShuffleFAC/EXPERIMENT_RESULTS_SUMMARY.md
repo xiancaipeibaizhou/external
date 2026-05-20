@@ -1,6 +1,6 @@
 # ShuffleFAC 实验结果总表
 
-更新时间：2026-05-17
+更新时间：2026-05-20
 
 本文件汇总当前项目中 ShuffleFAC 相关实验的主要结果。除特别说明外，主指标均为 strict recording-level test split 上的 recording-level 指标，不混入 clip-level 或 segment-level 指标。多 seed 统计使用 seed 42/43/44。
 
@@ -152,3 +152,61 @@
 - DeepShip threshold ablations：`results/ShuffleFAC_SIGNAL_NOISE/DeepShip_ThresholdOnly/seed*/metrics.json`、`results/ShuffleFAC_SIGNAL_NOISE/DeepShip_ETA_Complete/seed*/metrics.json`、`results/ShuffleFAC_SIGNAL_NOISE/DeepShip_ExpD_Warmup5/seed*/metrics.json`。
 - ShipsEar best seed43 ablations：`results/ShuffleFAC_SIGNAL_NOISE/ShipsEar_BestSeed43_ThresholdOnly/metrics.json`、`results/ShuffleFAC_SIGNAL_NOISE/ShipsEar_BestSeed43_ETA_Complete/metrics.json`、`results/ShuffleFAC_SIGNAL_NOISE/ShipsEar_BestSeed43_ExpD_Warmup5/metrics.json`。
 - ShipsEar seed43 threshold sweep：`results/ShuffleFAC_SIGNAL_NOISE/ShipsEar_BestSeed43_ExpD_Warmup5_Thr090/metrics.json`、`results/ShuffleFAC_SIGNAL_NOISE/ShipsEar_BestSeed43_ExpD_Warmup5_Thr095/metrics.json`、`results/ShuffleFAC_SIGNAL_NOISE/ShipsEar_BestSeed43_ExpD_Warmup5_Thr098/metrics.json`。
+
+## 表 5：DeepShip 前端鲁棒性与 SN-ExpD 论文结果锁定（2026-05-20）
+
+本节补充 `paper_results_materials_20260520` 中已经锁定的论文结果材料。统计口径统一为 **mean ± sample std over seeds 42/43/44**。不包含 smoke rows、不包含旧 `sn_decoupled` rows、不包含 `--head all` 输出、不包含未完成的 PANNs 非 sharedcache 目录；PANNs fine-tune 训练阶段 mean-prob test result 不作为最终 recording-level aggregation result。
+
+### 表 5.1：DeepShip clip-level front-end diagnostic 与参数效率
+
+该表只用于前端切片级能力和参数效率诊断，不作为最终 recording-level aggregation 排名依据。
+
+| front-end | Test clip ACC | Test clip Macro-F1 | Params | Trainable Params | MACs | Protocol note |
+|---|---:|---:|---:|---:|---:|---|
+| ShuffleFAC gamma=16 | 0.684325 ± 0.002286 | 0.683512 ± 0.002907 | 39,031 | 39,031 | 2.585M | DeepShip-trained ShuffleFAC, strict recording-level split |
+| ResNet18 | 0.675582 ± 0.013181 | 0.675608 ± 0.011486 | 11,172,292 | 11,172,292 | N/A | `train_clip_frontend.py`, `pretrained=none`, best checkpoint by val recording Macro-F1 |
+| MobileNetV2 | 0.667670 ± 0.004947 | 0.667747 ± 0.005353 | 2,228,420 | 2,228,420 | N/A | `train_clip_frontend.py`, `pretrained=none`, best checkpoint by val recording Macro-F1 |
+
+PANNs-CNN14 frozen 不放入该表，因为锁定的 PANNs 行使用 official AudioSet frozen embedding front-end，没有与 DeepShip-trained clip classifier 完全可比的 clip-level diagnostic。PANNs 只进入后续 frozen recording-level front-end 表。
+
+### 表 5.2：DeepShip formal non-SN recording-level aggregation
+
+该表评估 frozen front-end embeddings 上的普通 recording-level heads。
+
+| front-end | mean | attention | BiGRU | MIL linear softmax | best non-SN head | best non-SN Macro-F1 | seeds |
+|---|---:|---:|---:|---:|---|---:|---|
+| ShuffleFAC | 0.774015 ± 0.011171 | 0.774338 ± 0.011997 | 0.790255 ± 0.001098 | 0.692614 ± 0.024915 | BiGRU | 0.790255 ± 0.001098 | 42/43/44 |
+| ResNet18 | 0.756192 ± 0.013252 | 0.740216 ± 0.036356 | 0.730710 ± 0.027281 | 0.647293 ± 0.030482 | mean | 0.756192 ± 0.013252 | 42/43/44 |
+| MobileNetV2 | 0.741241 ± 0.031799 | 0.733914 ± 0.050809 | 0.741725 ± 0.035584 | 0.651732 ± 0.061479 | BiGRU | 0.741725 ± 0.035584 | 42/43/44 |
+| PANNs-CNN14 frozen | 0.575547 ± 0.098200 | 0.517527 ± 0.026984 | 0.555630 ± 0.007820 | 0.583431 ± 0.030770 | MIL linear softmax | 0.583431 ± 0.030770 | 42/43/44 |
+
+观察：ShuffleFAC + BiGRU 是当前最强 non-SN baseline，Macro-F1 = 0.790255 ± 0.001098。
+
+### 表 5.3：DeepShip best non-SN vs formal SN-ExpD-Warmup5
+
+正式 SN head 是 `sn_expd_warmup5`，不是旧的简化 `sn_decoupled`。该 head 使用 threshold-similarity noise graph、temporal edge、`signal_top_k=4` 和 `topk_warmup_epochs=5`。
+
+| front-end | best non-SN head | best non-SN Macro-F1 | SN-ExpD-Warmup5 Macro-F1 | Macro-F1 gain | SN-ExpD-Warmup5 ACC | seeds |
+|---|---|---:|---:|---:|---:|---|
+| ShuffleFAC | BiGRU | 0.790255 ± 0.001098 | 0.800943 ± 0.021182 | 0.010688 | 0.792350 ± 0.009465 | 42/43/44 |
+| ResNet18 | mean | 0.756192 ± 0.013252 | 0.705805 ± 0.013812 | -0.050387 | 0.743169 ± 0.012521 | 42/43/44 |
+| MobileNetV2 | BiGRU | 0.741725 ± 0.035584 | 0.769124 ± 0.029399 | 0.027399 | 0.775956 ± 0.017063 | 42/43/44 |
+| PANNs-CNN14 frozen | MIL linear softmax | 0.583431 ± 0.030770 | 0.651811 ± 0.033977 | 0.068380 | 0.677596 ± 0.034126 | 42/43/44 |
+
+最终最佳结果是 **ShuffleFAC + SN-ExpD-Warmup5**，Macro-F1 = **0.800943 ± 0.021182**，ACC = **0.792350 ± 0.009465**。该结果复现原 DeepShip SN ExpD Warmup5 主结果，并比 ShuffleFAC + BiGRU non-SN baseline 高 0.010688 Macro-F1。
+
+### 结果解释与论文边界
+
+- 论文主线应表述为：在可替换 frozen clip-level front-ends 之上研究 strict recording-level signal-noise decoupled aggregation。
+- ShuffleFAC 仍是参数效率最高且 clip-level diagnostic 最强的可比前端，但不要把论文主贡献写成新的 clip-level ShuffleFAC front-end。
+- 普通 recording-level heads 已经很强，尤其 ShuffleFAC + BiGRU 已达到 0.790255 ± 0.001098 Macro-F1。
+- SN-ExpD-Warmup5 在 ShuffleFAC、MobileNetV2、PANNs-CNN14 frozen 上提升，但在 ResNet18 上下降 0.050387 Macro-F1，因此不能宣称 SN 对所有前端一致提升。
+- PANNs-CNN14 frozen 在 SN-ExpD 下有明显相对提升，但绝对 Macro-F1 仍低于 ShuffleFAC 和 MobileNetV2。
+- 正式 SN 结果来自 `sn_expd_warmup5` / 原完整 ExpD Warmup5 机制，不来自旧 `sn_decoupled`。
+
+### 锁定来源
+
+- Table 1 source: `external/ShuffleFAC/FRONTEND_CLIP_ACCURACY_COMPARISON.md` 及对应 formal front-end metrics。
+- Table 2 source: `results/FRONTEND_ROBUSTNESS/formal_non_sn_summary_20260520/table2_lock_20260520/`。
+- Table 3 source: `results/FRONTEND_ROBUSTNESS/formal_sn_expd_warmup5_cross_frontend_20260520/table3_lock_20260520/`。
+- 论文材料文件：`external/ShuffleFAC/paper_results_materials_20260520/paper_results_tables.md`、`paper_results_analysis.md`、`paper_discussion_points.md`、`final_experiment_status.md`。
